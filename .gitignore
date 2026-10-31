@@ -1,0 +1,37 @@
+
+# CMake 构建目录
+build/
+cmake-build-*/
+out/
+
+# Visual Studio
+.vs/
+*.sln
+*.vcxproj*
+*.user
+*.suo
+
+# 编译产物
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# 日志与临时文件
+logs/
+*.log
+*.tmp
+*.bak
+
+# 本地配置与密钥
+.env
+.env.*
+!.env.example
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
