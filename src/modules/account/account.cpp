@@ -28,22 +28,6 @@ struct PlayerAccount final : IExtension
 {
     PROVIDE_EXT_UID(0x4F504163636F756E);
 
-    PlayerAccount(std::uint64_t connectSequence, std::string playerName)
-        : connectSequence(connectSequence)
-        , name(std::move(playerName))
-    {
-    }
-
-    static PlayerAccount* of(IPlayer& player)
-    {
-        return queryExtension<PlayerAccount>(player);
-    }
-
-    void freeExtension() override { delete this; }
-
-    // GMX 时保留当前玩家的账号状态。
-    void reset() override { }
-
     const std::uint64_t connectSequence;
     const std::string name;
     std::uint32_t accountId = 0;
@@ -51,6 +35,15 @@ struct PlayerAccount final : IExtension
     bool accountCheckPending = true;
     bool loggedIn = false;
     bool authenticationPending = false;
+
+    PlayerAccount(std::uint64_t connectSequence, std::string playerName)
+        : connectSequence(connectSequence)
+        , name(std::move(playerName)) { }
+
+    void freeExtension() override { delete this; }
+
+    // GMX 时保留当前玩家的账号状态。
+    void reset() override { }
 };
 
 Impl::DefaultEventDispatcher<OPAccount::EventHandler> g_eventDispatcher;
@@ -58,25 +51,6 @@ ankerl::unordered_dense::set<std::uint32_t> g_onlineAccountIds;
 std::uint64_t g_nextConnectSequence = 0;
 
 constexpr unsigned int kDuplicateEntryError = 1062;
-
-// 玩家 ID 可能在断线后复用，异步结果必须确认仍是发起请求的那次连接。
-template <typename Callback>
-auto forPlayerConnection(const IPlayer& player, const PlayerAccount& account, Callback callback)
-{
-    const auto playerId = player.getID();
-    const auto connectSequence = account.connectSequence;
-
-    return [playerId, connectSequence, callback = std::move(callback)](auto&&... args) mutable
-    {
-        ICore* core = OPCoreSharedPtr::core();
-        IPlayer* currentPlayer = core ? core->getPlayers().get(playerId) : nullptr;
-        PlayerAccount* currentAccount = currentPlayer ? PlayerAccount::of(*currentPlayer) : nullptr;
-        if (!currentAccount || currentAccount->connectSequence != connectSequence)
-            return;
-
-        callback(*currentPlayer, *currentAccount, std::forward<decltype(args)>(args)...);
-    };
-}
 
 bool isValidPassword(std::string_view password)
 {
@@ -107,6 +81,7 @@ OPAccount::AuthenticationResult logInPlayer(IPlayer& player, PlayerAccount& acco
     PeerAddress::AddressString address;
     PeerAddress::ToString(player.getNetworkData().networkID.address, address);
     const std::string ipAddress(address.data(), address.length());
+
     std::string escapedIp;
     if (!OPCoreMySQL::escapeString(ipAddress, escapedIp)
         || !OPCoreMySQL::queryAsync(fmt::format(
@@ -114,9 +89,7 @@ OPAccount::AuthenticationResult logInPlayer(IPlayer& player, PlayerAccount& acco
             "WHERE `id` = {} LIMIT 1",
             escapedIp, account.accountId)))
     {
-        OPCORE_LOG_WARN(
-            "[OPAccount] 账号 {} 已登录，但登录记录未能提交",
-            account.accountId);
+        OPCORE_LOG_WARN("[OPAccount] 账号 {} 已登录，但登录记录未能提交", account.accountId);
     }
 
     OPCORE_LOG_INFO("[OPAccount] {} (id {}) 登录", account.name, account.accountId);
@@ -132,7 +105,7 @@ void checkAccountExists(IPlayer& player, AccountCheckCallback onFinished)
     if (!onFinished)
         return;
 
-    if (PlayerAccount::of(player))
+    if (queryExtension<PlayerAccount>(player))
     {
         onFinished(player, AccountCheckResult::Failed);
         return;
@@ -150,6 +123,9 @@ void checkAccountExists(IPlayer& player, AccountCheckCallback onFinished)
         return;
     }
 
+    const auto playerId = player.getID();
+    const auto connectSequence = account->connectSequence;
+
     std::string escapedName;
     const bool queued =
         OPCoreMySQL::escapeString(account->name, escapedName)
@@ -158,59 +134,81 @@ void checkAccountExists(IPlayer& player, AccountCheckCallback onFinished)
                 "SELECT `id`, `password_hash` FROM `accounts` "
                 "WHERE `name` = '{}' AND `deleted_at` IS NULL LIMIT 1",
                 escapedName),
-            forPlayerConnection(player, *account,
-                [onFinished](IPlayer& player, PlayerAccount& account, OPCoreMySQL::QueryResult result)
+            [playerId, connectSequence, onFinished](OPCoreMySQL::QueryResult result)
             {
+                ICore* core = OPCoreSharedPtr::core();
+                IPlayer* currentPlayer = core
+                    ? core->getPlayers().get(playerId)
+                    : nullptr;
+
+                if (!currentPlayer)
+                    return;
+
+                PlayerAccount* currentAccount = queryExtension<PlayerAccount>(currentPlayer);
+                if (!currentAccount || currentAccount->connectSequence != connectSequence)
+                    return;
+
                 if (result.rows.empty())
                 {
-                    account.accountCheckPending = false;
-                    onFinished(player, AccountCheckResult::NotRegistered);
+                    currentAccount->accountCheckPending = false;
+                    onFinished(*currentPlayer, AccountCheckResult::NotRegistered);
                     return;
                 }
 
                 const auto& row = result.rows.front();
                 std::uint32_t accountId = 0;
+
                 if (row.size() < 2 || !row[0] || row[0]->empty() || !row[1] || row[1]->empty())
                 {
-                    account.accountCheckPending = false;
+                    currentAccount->accountCheckPending = false;
                     OPCORE_LOG_ERROR(
                         "[OPAccount] 读取玩家 {} 的账号信息失败：数据库返回的数据不完整",
-                        account.name);
-                    onFinished(player, AccountCheckResult::Failed);
+                        currentAccount->name);
+                    onFinished(*currentPlayer, AccountCheckResult::Failed);
                     return;
                 }
 
                 const char* begin = row[0]->data();
                 const char* end = begin + row[0]->size();
                 const auto parsedId = std::from_chars(begin, end, accountId);
+
                 if (parsedId.ec != std::errc{} || parsedId.ptr != end || accountId == 0)
                 {
-                    account.accountCheckPending = false;
+                    currentAccount->accountCheckPending = false;
                     OPCORE_LOG_ERROR(
                         "[OPAccount] 读取玩家 {} 的账号信息失败：账号 ID 无效",
-                        account.name);
-                    onFinished(player, AccountCheckResult::Failed);
+                        currentAccount->name);
+                    onFinished(*currentPlayer, AccountCheckResult::Failed);
                     return;
                 }
 
-                account.accountId = accountId;
-                account.passwordHash = *row[1];
-                account.accountCheckPending = false;
-                onFinished(player, AccountCheckResult::Registered);
-            }),
-            forPlayerConnection(player, *account,
-                [onFinished](
-                    IPlayer& player,
-                    PlayerAccount& account,
-                    unsigned int code,
-                    const std::string& message)
+                currentAccount->accountId = accountId;
+                currentAccount->passwordHash = *row[1];
+                currentAccount->accountCheckPending = false;
+                onFinished(*currentPlayer, AccountCheckResult::Registered);
+            },
+            [playerId, connectSequence, onFinished](
+                unsigned int code,
+                const std::string& message)
             {
-                account.accountCheckPending = false;
+                ICore* core = OPCoreSharedPtr::core();
+                IPlayer* currentPlayer = core
+                    ? core->getPlayers().get(playerId)
+                    : nullptr;
+
+                if (!currentPlayer)
+                    return;
+
+                PlayerAccount* currentAccount = queryExtension<PlayerAccount>(currentPlayer);
+                if (!currentAccount || currentAccount->connectSequence != connectSequence)
+                    return;
+
+                currentAccount->accountCheckPending = false;
                 OPCORE_LOG_ERROR(
                     "[OPAccount] 检查玩家 {} 的账号失败：[{}] {}",
-                    account.name, code, message);
-                onFinished(player, AccountCheckResult::Failed);
-            }));
+                    currentAccount->name, code, message);
+                onFinished(*currentPlayer, AccountCheckResult::Failed);
+            });
 
     // escapeString 或 queryAsync 返回 false 时，都不会触发异步回调。
     if (!queued)
@@ -231,25 +229,28 @@ void login(IPlayer& player, std::string password, AuthenticationCallback onFinis
         return;
     }
 
-    PlayerAccount* account = PlayerAccount::of(player);
+    PlayerAccount* account = queryExtension<PlayerAccount>(player);
     if (!account || account->loggedIn)
     {
         OPCoreHash::wipe(password);
         onFinished(player, AuthenticationResult::Failed);
         return;
     }
+
     if (account->accountCheckPending || account->authenticationPending)
     {
         OPCoreHash::wipe(password);
         onFinished(player, AuthenticationResult::InProgress);
         return;
     }
+
     if (account->accountId == 0 || account->passwordHash.empty())
     {
         OPCoreHash::wipe(password);
         onFinished(player, AuthenticationResult::Failed);
         return;
     }
+
     if (!isValidPassword(password))
     {
         OPCoreHash::wipe(password);
@@ -258,18 +259,31 @@ void login(IPlayer& player, std::string password, AuthenticationCallback onFinis
     }
 
     account->authenticationPending = true;
+
+    const auto playerId = player.getID();
+    const auto connectSequence = account->connectSequence;
+
     const bool queued = OPCoreHash::verifyAsync(
-        std::move(password), account->passwordHash,
-        forPlayerConnection(player, *account,
-            [onFinished](
-                IPlayer& player,
-                PlayerAccount& account,
-                OPCoreHash::VerifyResult result)
+        std::move(password),
+        account->passwordHash,
+        [playerId, connectSequence, onFinished](OPCoreHash::VerifyResult result)
         {
+            ICore* core = OPCoreSharedPtr::core();
+            IPlayer* currentPlayer = core
+                ? core->getPlayers().get(playerId)
+                : nullptr;
+
+            if (!currentPlayer)
+                return;
+
+            PlayerAccount* currentAccount = queryExtension<PlayerAccount>(currentPlayer);
+            if (!currentAccount || currentAccount->connectSequence != connectSequence)
+                return;
+
             if (!result.matched)
             {
-                account.authenticationPending = false;
-                onFinished(player, AuthenticationResult::IncorrectPassword);
+                currentAccount->authenticationPending = false;
+                onFinished(*currentPlayer, AuthenticationResult::IncorrectPassword);
                 return;
             }
 
@@ -278,19 +292,20 @@ void login(IPlayer& player, std::string password, AuthenticationCallback onFinis
                 std::string escapedHash;
                 if (!OPCoreMySQL::escapeString(result.rehash, escapedHash)
                     || !OPCoreMySQL::queryAsync(fmt::format(
-                        "UPDATE `accounts` SET `password_hash` = '{}' WHERE `id` = {} LIMIT 1",
-                        escapedHash, account.accountId)))
+                        "UPDATE `accounts` SET `password_hash` = '{}' "
+                        "WHERE `id` = {} LIMIT 1",
+                        escapedHash, currentAccount->accountId)))
                 {
                     OPCORE_LOG_WARN(
                         "[OPAccount] 账号 {} 的密码哈希升级未能提交",
-                        account.accountId);
+                        currentAccount->accountId);
                 }
             }
 
-            const AuthenticationResult loginResult = logInPlayer(player, account);
-            account.authenticationPending = false;
-            onFinished(player, loginResult);
-        }));
+            const AuthenticationResult loginResult = logInPlayer(*currentPlayer, *currentAccount);
+            currentAccount->authenticationPending = false;
+            onFinished(*currentPlayer, loginResult);
+        });
 
     if (!queued)
     {
@@ -308,25 +323,28 @@ void registerAccount(IPlayer& player, std::string password, AuthenticationCallba
         return;
     }
 
-    PlayerAccount* account = PlayerAccount::of(player);
+    PlayerAccount* account = queryExtension<PlayerAccount>(player);
     if (!account || account->loggedIn)
     {
         OPCoreHash::wipe(password);
         onFinished(player, AuthenticationResult::Failed);
         return;
     }
+
     if (account->accountCheckPending || account->authenticationPending)
     {
         OPCoreHash::wipe(password);
         onFinished(player, AuthenticationResult::InProgress);
         return;
     }
+
     if (account->accountId != 0)
     {
         OPCoreHash::wipe(password);
         onFinished(player, AuthenticationResult::NameAlreadyTaken);
         return;
     }
+
     if (!isValidPassword(password))
     {
         OPCoreHash::wipe(password);
@@ -335,28 +353,44 @@ void registerAccount(IPlayer& player, std::string password, AuthenticationCallba
     }
 
     account->authenticationPending = true;
+
+    const auto playerId = player.getID();
+    const auto connectSequence = account->connectSequence;
+
     const bool hashQueued = OPCoreHash::hashAsync(
         std::move(password),
-        forPlayerConnection(player, *account,
-            [onFinished](IPlayer& player, PlayerAccount& account, std::string passwordHash)
+        [playerId, connectSequence, onFinished](std::string passwordHash)
         {
+            ICore* core = OPCoreSharedPtr::core();
+            IPlayer* currentPlayer = core
+                ? core->getPlayers().get(playerId)
+                : nullptr;
+
+            if (!currentPlayer)
+                return;
+
+            PlayerAccount* currentAccount = queryExtension<PlayerAccount>(currentPlayer);
+            if (!currentAccount || currentAccount->connectSequence != connectSequence)
+                return;
+
             if (passwordHash.empty())
             {
-                OPCORE_LOG_ERROR("[OPAccount] {} 的密码哈希生成失败", account.name);
-                account.authenticationPending = false;
-                onFinished(player, AuthenticationResult::Failed);
+                OPCORE_LOG_ERROR("[OPAccount] {} 的密码哈希生成失败", currentAccount->name);
+                currentAccount->authenticationPending = false;
+                onFinished(*currentPlayer, AuthenticationResult::Failed);
                 return;
             }
 
             PeerAddress::AddressString address;
-            PeerAddress::ToString(player.getNetworkData().networkID.address, address);
+            PeerAddress::ToString(currentPlayer->getNetworkData().networkID.address, address);
             const std::string ipAddress(address.data(), address.length());
 
             std::string escapedName;
             std::string escapedHash;
             std::string escapedIp;
+
             const bool queued =
-                OPCoreMySQL::escapeString(account.name, escapedName)
+                OPCoreMySQL::escapeString(currentAccount->name, escapedName)
                 && OPCoreMySQL::escapeString(passwordHash, escapedHash)
                 && OPCoreMySQL::escapeString(ipAddress, escapedIp)
                 && OPCoreMySQL::queryAsync(
@@ -365,57 +399,80 @@ void registerAccount(IPlayer& player, std::string password, AuthenticationCallba
                         "(`name`, `password_hash`, `created_at`, `last_login_at`, `last_ip`) "
                         "VALUES ('{}', '{}', UTC_TIMESTAMP(), UTC_TIMESTAMP(), '{}')",
                         escapedName, escapedHash, escapedIp),
-                    forPlayerConnection(player, account,
-                        [onFinished](IPlayer& player, PlayerAccount& account, OPCoreMySQL::QueryResult result)
+                    [playerId, connectSequence, onFinished](OPCoreMySQL::QueryResult result)
                     {
+                        ICore* core = OPCoreSharedPtr::core();
+                        IPlayer* currentPlayer = core
+                            ? core->getPlayers().get(playerId)
+                            : nullptr;
+
+                        if (!currentPlayer)
+                            return;
+
+                        PlayerAccount* currentAccount = queryExtension<PlayerAccount>(currentPlayer);
+                        if (!currentAccount || currentAccount->connectSequence != connectSequence)
+                            return;
+
                         if (result.insertId == 0
                             || result.insertId > std::numeric_limits<std::uint32_t>::max())
                         {
                             OPCORE_LOG_ERROR(
                                 "[OPAccount] 注册账号 {} 失败：数据库返回了无效的账号 ID",
-                                account.name);
-                            account.authenticationPending = false;
-                            onFinished(player, AuthenticationResult::Failed);
+                                currentAccount->name);
+                            currentAccount->authenticationPending = false;
+                            onFinished(*currentPlayer, AuthenticationResult::Failed);
                             return;
                         }
 
-                        account.accountId = static_cast<std::uint32_t>(result.insertId);
-                        OPCORE_LOG_INFO("[OPAccount] 新账号 {} 注册成功", account.name);
-                        const AuthenticationResult loginResult = logInPlayer(player, account);
-                        account.authenticationPending = false;
-                        onFinished(player, loginResult);
-                    }),
-                    forPlayerConnection(player, account,
-                        [onFinished](
-                            IPlayer& player,
-                            PlayerAccount& account,
-                            unsigned int code,
-                            const std::string& message)
+                        currentAccount->accountId = static_cast<std::uint32_t>(result.insertId);
+                        OPCORE_LOG_INFO("[OPAccount] 新账号 {} 注册成功", currentAccount->name);
+
+                        const AuthenticationResult loginResult =
+                            logInPlayer(*currentPlayer, *currentAccount);
+
+                        currentAccount->authenticationPending = false;
+                        onFinished(*currentPlayer, loginResult);
+                    },
+                    [playerId, connectSequence, onFinished](
+                        unsigned int code,
+                        const std::string& message)
                     {
+                        ICore* core = OPCoreSharedPtr::core();
+                        IPlayer* currentPlayer = core
+                            ? core->getPlayers().get(playerId)
+                            : nullptr;
+
+                        if (!currentPlayer)
+                            return;
+
+                        PlayerAccount* currentAccount = queryExtension<PlayerAccount>(currentPlayer);
+                        if (!currentAccount || currentAccount->connectSequence != connectSequence)
+                            return;
+
                         if (code != kDuplicateEntryError)
                         {
                             OPCORE_LOG_ERROR(
                                 "[OPAccount] 注册账号 {} 失败：[{}] {}",
-                                account.name, code, message);
+                                currentAccount->name, code, message);
                         }
 
-                        account.authenticationPending = false;
+                        currentAccount->authenticationPending = false;
                         onFinished(
-                            player,
+                            *currentPlayer,
                             code == kDuplicateEntryError
                                 ? AuthenticationResult::NameAlreadyTaken
                                 : AuthenticationResult::Failed);
-                    }));
+                    });
 
             if (!queued)
             {
                 OPCORE_LOG_ERROR(
                     "[OPAccount] 注册账号 {} 失败：字符串转义失败或数据库请求未能进入执行队列",
-                    account.name);
-                account.authenticationPending = false;
-                onFinished(player, AuthenticationResult::Failed);
+                    currentAccount->name);
+                currentAccount->authenticationPending = false;
+                onFinished(*currentPlayer, AuthenticationResult::Failed);
             }
-        }));
+        });
 
     if (!hashQueued)
     {
@@ -427,19 +484,19 @@ void registerAccount(IPlayer& player, std::string password, AuthenticationCallba
 
 bool isLoggedIn(IPlayer& player)
 {
-    const PlayerAccount* account = PlayerAccount::of(player);
+    const PlayerAccount* account = queryExtension<PlayerAccount>(player);
     return account && account->loggedIn;
 }
 
 std::uint32_t getID(IPlayer& player)
 {
-    const PlayerAccount* account = PlayerAccount::of(player);
+    const PlayerAccount* account = queryExtension<PlayerAccount>(player);
     return account && account->loggedIn ? account->accountId : 0;
 }
 
 StringView getName(IPlayer& player)
 {
-    const PlayerAccount* account = PlayerAccount::of(player);
+    const PlayerAccount* account = queryExtension<PlayerAccount>(player);
     if (!account)
         return {};
 
@@ -472,16 +529,16 @@ public:
 
         const std::string query = fmt::format(
             "CREATE TABLE IF NOT EXISTS `accounts` ("
-            "  `id`            INT UNSIGNED NOT NULL AUTO_INCREMENT,"
-            "  `name`          VARCHAR(24)  NOT NULL,"
-            "  `original_name` VARCHAR(24)  NULL,"
-            "  `password_hash` VARCHAR({})  NOT NULL,"
-            "  `created_at`    DATETIME     NOT NULL,"
-            "  `last_login_at` DATETIME     NULL,"
-            "  `last_ip`       VARCHAR(45)  NULL,"
-            "  `deleted_at`    DATETIME     NULL,"
-            "  PRIMARY KEY (`id`),"
-            "  UNIQUE KEY `uk_accounts_name` (`name`)"
+            "`id` INT UNSIGNED NOT NULL AUTO_INCREMENT, "
+            "`name` VARCHAR(24) NOT NULL, "
+            "`original_name` VARCHAR(24) NULL, "
+            "`password_hash` VARCHAR({}) NOT NULL, "
+            "`created_at` DATETIME NOT NULL, "
+            "`last_login_at` DATETIME NULL, "
+            "`last_ip` VARCHAR(45) NULL, "
+            "`deleted_at` DATETIME NULL, "
+            "PRIMARY KEY (`id`), "
+            "UNIQUE KEY `uk_accounts_name` (`name`)"
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
             OPCoreHash::kHashCapacity);
 
@@ -489,9 +546,7 @@ public:
         if (OPCoreMySQL::executeSync(query, &error))
             return true;
 
-        OPCORE_LOG_CRITICAL(
-            "[OPAccount] 创建 accounts 表失败：[{}] {}",
-            error.code, error.message);
+        OPCORE_LOG_CRITICAL("[OPAccount] 创建 accounts 表失败：[{}] {}", error.code, error.message);
         return false;
     }
 
@@ -499,7 +554,7 @@ public:
 
     void onPlayerDisconnect(IPlayer& player, PeerDisconnectReason) override
     {
-        PlayerAccount* account = PlayerAccount::of(player);
+        PlayerAccount* account = queryExtension<PlayerAccount>(player);
         if (!account || !account->loggedIn)
             return;
 

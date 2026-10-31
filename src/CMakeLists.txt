@@ -10,7 +10,9 @@ target_sources(${PROJECT_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/modules/utils/dialog.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/modules/utils/kick.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/modules/account/account.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/modules/account/example_login.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/modules/account/example.cpp"
+    
+    "${CMAKE_CURRENT_SOURCE_DIR}/modules/email/email.cpp"
 )
 
 add_subdirectory(core/mysql)

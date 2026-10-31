@@ -128,9 +128,7 @@ void handlePasswordDialogResponse(
 
     if (!response.accepted)
     {
-        OPUtil::kickWithMessage(
-            player,
-            registering ? kRegistrationCancelledMessage : kLoginCancelledMessage);
+        OPUtil::kickWithMessage(player, registering ? kRegistrationCancelledMessage : kLoginCancelledMessage);
         return;
     }
 
